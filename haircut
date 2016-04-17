@@ -31,7 +31,7 @@ indicator_cal <- function(dataset, interval, conf){
 		yield <- 0
 	  } else {
 		p <- dataset$closeprice
-		yield <- (p[interval:n] - p[1:(n-interval+1)])/p[1:(n-interval+1)]
+		yield <- (p[(interval + 1):n] - p[1:(n-interval)])/p[1:(n-interval)]
 	  }
 	}
 
