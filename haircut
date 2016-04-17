@@ -1,0 +1,105 @@
+library(RODBC)
+library(WindR)
+w.start()
+
+setwd("d:/")
+
+#### parameters
+interval <- 65
+conf <- 0.05
+
+#### read source data from database and wind ####
+stock_hq <- read.csv("hq_stock.csv", header = TRUE)
+stock_hq <- stock_hq[,c(-1, -3, -5, -6, -8)]
+stock_hq$secode <- as.character(stock_hq$secode)
+
+index <- w.wsd("000001.SH","close,pct_chg","2002-01-01","2016-04-13","PriceAdj=F")$Data
+names(index) <- c("tradedate", "closeprice", "pct_chg")
+
+#### dataset formatting ####
+data_stock <- split(stock_hq, stock_hq$secode)
+data_all <- c(data_stock, '000001.SH' = list(index)
+
+#### calculating indicators ####
+indicator_cal <- function(dataset, interval, conf){
+
+	#### calcuate interval yield 
+	yield <- function(dataset, interval){
+	  n <- dim(dataset)[1]
+	  
+	  if (n <= interval) {
+		yield <- 0
+	  } else {
+		p <- dataset$closeprice
+		yield <- (p[interval:n] - p[1:(n-interval+1)])/p[1:(n-interval+1)]
+	  }
+	}
+
+	all_yield <- lapply(dataset, yield, interval)
+
+	#### calculate indicators
+	summary_yield <- function(dataset, conf) {
+		
+		obs <- length(dataset)
+		avg <- mean(dataset)
+		std <- sd(dataset)
+		quantile_norm <- qnorm(conf, mean = avg, sd = std)
+		quantile_exp <- quantile(ecdf(dataset), conf)
+		haircut <- exp(quantile_norm) - 1
+		output <- c(obs, avg, std, quantile_norm, quantile_exp, haircut)
+	
+	}
+
+	all_summary <- do.call(rbind.data.frame, lapply(all_yield, summary_yield, conf))
+	names(all_summary) <- c("obs", "avg", "std", "quantile_norm", "quantile_exp", "haircut")
+	all_summary <- data.frame(code = rownames(all_summary), all_summary, row.names = NULL)
+	
+	output <- list(yield = all_yield, indicators = all_summary)
+}
+
+indicator <- indicator_cal(data_all, interval, conf)
+
+#### haircut adjustments ####
+hc <- indicator$indicators
+threshold <- hc[hc$code == '000001.SH', "haircut"]
+
+limit <- 90
+attach(hc)
+hc$mkt <- w.wsd(code, "mkt", "2016-04-07", "2016-04-07")$Data[,2]
+hc$industry <- w.wsd(code, "industry_sw", "2016-04-07", "2016-04-07", "industryType=1")$Data[,2]
+hc[obs <= limit, "haircut"] <- min(hc$haircut, na.rm = TRUE) 		# stockes with limited obs will allocated minimum haircut
+hc[hc$haircut > threshold, "haircut"] <- threshold 		# max stock should not exceed market haircut(000001.SH)
+detach(hc)
+
+#### mid-small market haircut adjustments
+hc$haircutAdj <- hc$haircut
+
+base_s <- -0.65
+with(hc, {
+	std_s <- min(hc[mkt == "创业板" & obs > limit, "std"])
+	tmax <- max(hc[mkt == "创业板", "haircut"])
+	tmin <- min(hc[mkt == "创业板", "haircut"])
+	hc[mkt == "创业板", "haircutAdj"] <<- (base_s + std_s) / 2 + (base_s - std_s) * (hc[mkt == "创业板", "haircut"] - (tmax + tmin) / 2) / (tmax - tmin)
+})
+
+base_m <- -0.55
+with(hc, {
+	std_s <- min(hc[mkt == "中小企业板" & obs > limit, "std"])
+	tmax <- max(hc[mkt == "中小企业板", "haircut"])
+	tmin <- min(hc[mkt == "中小企业板", "haircut"])
+	hc[mkt == "中小企业板", "haircutAdj"] <<- (base_m + std_s) / 2 + (base_m - std_s) * (hc[mkt == "中小企业板", "haircut"] - (tmax + tmin) / 2) / (tmax - tmin)
+})
+
+#### fundamental financial adjustments
+attach(hc)
+hc$np_l <- w.wsd(code, "net_profit_is", "2014-12-31", "2014-12-31", "rptType=1")$Data[,2]
+hc$np <- w.wsd(code, "net_profit_is", "2015-9-30", "2015-9-30", "rptType=1")$Data[,2]
+hc$bps <- w.wsd(code,"bps_new","2015-9-30","2015-9-30")$Data[,2]
+detach(hc)
+
+hc[is.na(hc)] <- -999 
+
+hc[na.omit(hc$bps) < 1, "hairc"] <- (1 + hc[na.omit(hc$bps) < 1, "haircutAdj"]) * 0.5
+hc[na.omit(hc$bps) < 1 & hc$np <0 & hc$np_l <0 , "hairc"] <- (1 + hc[na.omit(hc$bps) < 1 & hc$np <0 & hc$np_l <0, "haircutAdj"]) * 0.3
+hc[na.omit(hc$bps) >= 1, "hairc"] <- 1 + hc[na.omit(hc$bps) >= 1, "haircutAdj"]
+hc[na.omit(hc$bps) >= 1 & hc$np <0 & hc$np_l <0, "hairc"] <- (1 + hc[na.omit(hc$bps) >= 1 & hc$np <0 & hc$np_l <0, "haircutAdj"]) * 0.5
